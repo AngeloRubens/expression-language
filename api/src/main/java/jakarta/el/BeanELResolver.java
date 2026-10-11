@@ -21,6 +21,9 @@ package jakarta.el;
 
 import static jakarta.el.ELUtil.getExceptionMessageString;
 
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.SoftReference;
 import java.lang.reflect.InvocationTargetException;
@@ -133,12 +136,12 @@ public class BeanELResolver extends ELResolver {
             if (BPRef == null) {
                 return null;
             }
-            if (BPRef.get() == null) {
+            BeanProperties value = BPRef.get();
+            if (value == null) {
                 // value has been garbage collected, remove entry in map
                 map.remove(key);
-                return null;
             }
-            return BPRef.get();
+            return value;
         }
     }
 
@@ -149,12 +152,22 @@ public class BeanELResolver extends ELResolver {
     /*
      * Defines a property for a bean.
      */
+    private static final MethodType READ_HANDLE_TYPE = MethodType.methodType(Object.class, Object.class);
+
+    private static final MethodHandle NO_HANDLE = MethodHandles.constant(Object.class, null);
+
     abstract static class BeanProperty {
 
         final private Class<?> baseClass;
         final private Class<?> type;
         private Method readMethod;
         private Method writeMethod;
+
+        /*
+         * The read method as a method handle of type (Object)Object, which is access checked once when it is created
+         * instead of on every call like Method.invoke, or NO_HANDLE when it cannot be accessed through the public lookup.
+         */
+        private MethodHandle readHandle;
 
         public BeanProperty(Class<?> baseClass, Class<?> type) {
             this.baseClass = baseClass;
@@ -174,6 +187,19 @@ public class BeanELResolver extends ELResolver {
                 readMethod = ELUtil.getMethod(baseClass, base, getReadMethod());
             }
             return readMethod;
+        }
+
+        MethodHandle getReadHandle(Method readMethod) {
+            MethodHandle handle = this.readHandle;
+            if (handle == null) {
+                try {
+                    handle = MethodHandles.publicLookup().unreflect(readMethod).asType(READ_HANDLE_TYPE);
+                } catch (IllegalAccessException e) {
+                    handle = NO_HANDLE;
+                }
+                this.readHandle = handle;
+            }
+            return handle == NO_HANDLE ? null : handle;
         }
 
         public Method getWriteMethod(Object base) {
@@ -308,15 +334,28 @@ public class BeanELResolver extends ELResolver {
             return null;
         }
 
-        Method method = getBeanProperty(context, base, property).getReadMethod(base);
+        BeanProperty beanProperty = getBeanProperty(context, base, property);
+        Method method = beanProperty.getReadMethod(base);
         if (method == null) {
             throw new PropertyNotFoundException(
                     getExceptionMessageString(context, "propertyNotReadable", new Object[] { base.getClass().getName(), property.toString() }));
         }
 
         Object value;
+        MethodHandle handle = beanProperty.getReadHandle(method);
+        if (handle != null) {
+            try {
+                value = (Object) handle.invokeExact(base);
+            } catch (Throwable t) {
+                // What Method.invoke reports as the cause of an InvocationTargetException.
+                throw new ELException(t);
+            }
+            context.setPropertyResolved(base, property);
+            return value;
+        }
+
         try {
-            value = method.invoke(base, new Object[0]);
+            value = method.invoke(base);
             context.setPropertyResolved(base, property);
         } catch (ELException ex) {
             throw ex;
